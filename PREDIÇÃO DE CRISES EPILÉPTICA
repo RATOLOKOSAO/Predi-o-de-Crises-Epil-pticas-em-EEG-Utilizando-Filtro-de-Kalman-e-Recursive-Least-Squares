@@ -1,0 +1,595 @@
+
+# TCC: PREDIÇÃO DE CRISES EPILÉPTICAS - MATRIZES DE CONFUSÃO POR PACIENTE
+
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix
+from scipy.stats import entropy
+from tqdm import tqdm
+import warnings
+import re
+from pathlib import Path
+import mne
+import seaborn as sns
+
+warnings.filterwarnings('ignore')
+plt.rcParams['figure.max_open_warning'] = 50
+
+# 1. CONFIGURAÇÃO
+
+BASE_DIR = Path(r"C:\Users\rafae\Downloads\chb-mit-scalp-eeg-database-1.0.0\chb-mit-scalp-eeg-database-1.0.0")
+PATIENT_DIRS = [f"chb{i:02}" for i in range(1, 25)]  # TODOS os 24 pacientes
+
+# Parâmetros otimizados
+WINDOW_SEC = 2.0
+OVERLAP = 0.5
+PREDICTION_HORIZON_SEC = 30  # 30s antes
+SMOOTHING_WINDOW = 10
+
+# Parâmetros de algoritmos
+KALMAN_Q = 1e-3
+KALMAN_R = 1e-2
+RLS_ORDER = 10
+RLS_LAMBDA = 0.98
+
+print("=" * 80)
+print("TCC: ANÁLISE POR PACIENTE - MATRIZES DE CONFUSÃO INDIVIDUAIS")
+print("🎯 Objetivo: Identificar alteração de estado (Normal → Pré-ictal)")
+print("=" * 80)
+
+# 2. ALGORITMOS ADAPTATIVOS
+
+class KalmanFilter:
+    """Filtro de Kalman"""
+    def __init__(self, Q=1e-3, R=1e-2):
+        self.Q = Q
+        self.R = R
+        self.x = 0
+        self.P = 1
+        self.name = "Kalman"
+    
+    def update(self, z):
+        x_pred = self.x
+        P_pred = self.P + self.Q
+        K = P_pred / (P_pred + self.R)
+        self.x = x_pred + K * (z - x_pred)
+        self.P = (1 - K) * P_pred
+        return self.x, abs(z - x_pred)
+    
+    def reset(self):
+        self.x = 0
+        self.P = 1
+
+
+class RLSFilter:
+    """RLS"""
+    def __init__(self, order=10, delta=1.0, lam=0.98):
+        self.order = order
+        self.delta = delta
+        self.lam = lam
+        self.w = np.zeros(order)
+        self.P = np.eye(order) / delta
+        self.buffer = np.zeros(order)
+        self.name = "RLS"
+    
+    def update(self, z):
+        self.buffer = np.roll(self.buffer, 1)
+        self.buffer[0] = z
+        
+        y_pred = np.dot(self.w, self.buffer)
+        error = abs(z - y_pred)
+        
+        pi = np.dot(self.P, self.buffer)
+        k = pi / (self.lam + np.dot(self.buffer, pi))
+        self.w = self.w + k * (z - y_pred)
+        self.P = (self.P - np.outer(k, pi)) / self.lam
+        
+        return y_pred, error
+    
+    def reset(self):
+        self.w = np.zeros(self.order)
+        self.P = np.eye(self.order) / self.delta
+        self.buffer = np.zeros(self.order)
+
+# 3. FUNÇÕES DE FEATURES
+
+def shannon_entropy(signal):
+    """Entropia de Shannon Normalizada"""
+    hist, _ = np.histogram(signal, bins=50, density=True)
+    hist = hist[hist > 0]
+    return entropy(hist) / np.log(len(hist)) if len(hist) > 1 else 0
+
+
+def extract_multiple_features(window_data):
+    """Extrai MÚLTIPLAS features por janela"""
+    features = {}
+    features['entropy'] = shannon_entropy(window_data.flatten())
+    features['energy'] = np.mean(window_data**2)
+    features['variance'] = np.var(window_data)
+    features['mean_abs'] = np.mean(np.abs(window_data))
+    return features
+
+
+def extract_summary_data(summary_path):
+    """Extrai crises do arquivo summary"""
+    seizures = []
+    try:
+        with open(summary_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+    except:
+        return pd.DataFrame()
+
+    lines = content.split('\n')
+    current_file = None
+    
+    for i, line in enumerate(lines):
+        if 'File Name:' in line:
+            current_file = line.split('File Name:')[1].strip().split()[0]
+        
+        if 'Seizure' in line and 'Start Time:' in line:
+            try:
+                start = int(re.search(r'Start Time: (\d+)', line).group(1))
+                for j in range(i+1, min(i+5, len(lines))):
+                    if 'End Time:' in lines[j]:
+                        end = int(re.search(r'End Time: (\d+)', lines[j]).group(1))
+                        seizures.append({'file': current_file, 'start': start, 'end': end})
+                        break
+            except:
+                continue
+    
+    return pd.DataFrame(seizures)
+
+
+def load_edf_file(edf_path, seizure_info):
+    """Carrega EDF e extrai múltiplas features"""
+    try:
+        raw = mne.io.read_raw_edf(str(edf_path), preload=True, verbose=False)
+        sfreq = raw.info['sfreq']
+        
+        eeg_channels = [ch for ch in raw.ch_names 
+                       if (ch.startswith(('FP', 'F', 'T', 'C', 'P', 'O')) 
+                           and '-' in ch and 'EKG' not in ch)]
+        
+        if not eeg_channels:
+            return pd.DataFrame()
+        
+        raw.pick_channels(eeg_channels[:1])
+        
+        samples_per_window = int(sfreq * WINDOW_SEC)
+        hop = int(samples_per_window * (1 - OVERLAP))
+        n_windows = (raw.n_times - samples_per_window) // hop + 1
+        
+        data = []
+        file_name = edf_path.name
+        file_seizures = seizure_info[seizure_info['file'] == file_name]
+        
+        for i in range(n_windows):
+            start_sample = i * hop
+            t0 = start_sample / sfreq
+            t1 = t0 + WINDOW_SEC
+            
+            window_data = raw.get_data(start=start_sample, stop=start_sample + samples_per_window)
+            features = extract_multiple_features(window_data)
+            
+            label = 0
+            pre_ictal = 0
+            
+            for _, sz in file_seizures.iterrows():
+                if max(t0, sz['start']) < min(t1, sz['end']):
+                    label = 1
+                
+                pre_ictal_start = sz['start'] - PREDICTION_HORIZON_SEC
+                if pre_ictal_start <= t0 < sz['start']:
+                    pre_ictal = 1
+            
+            data.append({
+                'file': file_name,
+                't0': t0,
+                't1': t1,
+                'entropy': features['entropy'],
+                'energy': features['energy'],
+                'variance': features['variance'],
+                'mean_abs': features['mean_abs'],
+                'label': label,
+                'pre_ictal': pre_ictal
+            })
+        
+        return pd.DataFrame(data)
+    
+    except Exception as e:
+        return pd.DataFrame()
+
+# 4. CARREGAMENTO DE DADOS
+
+print("\n" + "=" * 80)
+print(f"CARREGANDO DADOS - {len(PATIENT_DIRS)} PACIENTES")
+print("ESTE PROCESSO LEVARÁ HORAS. Aguarde...")
+print("=" * 80)
+
+all_data = []
+patients_loaded = []
+
+for patient_id in tqdm(PATIENT_DIRS, desc="Processando pacientes"):
+    patient_dir = BASE_DIR / patient_id
+    
+    if not patient_dir.exists():
+        continue
+    
+    summary_file = patient_dir / f"{patient_id}-summary.txt"
+    if not summary_file.exists():
+        summary_file = patient_dir / f"{patient_id}_summary.txt"
+    
+    if not summary_file.exists():
+        continue
+    
+    seizure_info = extract_summary_data(summary_file)
+    edf_files = sorted(patient_dir.glob("*.edf"))
+    
+    patient_files_loaded = 0
+    for edf_path in edf_files:
+        df_file = load_edf_file(edf_path, seizure_info)
+        if not df_file.empty:
+            df_file['patient'] = patient_id
+            all_data.append(df_file)
+            patient_files_loaded += 1
+    
+    if patient_files_loaded > 0:
+        patients_loaded.append(patient_id)
+
+if not all_data:
+    print("NENHUM DADO CARREGADO!")
+    exit()
+
+df = pd.concat(all_data, ignore_index=True)
+
+# Feature combinada (média normalizada)
+for feature in ['entropy', 'energy', 'variance', 'mean_abs']:
+    df[f'{feature}_norm'] = df.groupby('file')[feature].transform(
+        lambda x: (x - x.min()) / (x.max() - x.min() + 1e-10)
+    )
+
+df['feature_combined'] = (df['entropy_norm'] + df['energy_norm'] + 
+                          df['variance_norm'] + df['mean_abs_norm']) / 4
+
+print(f"\nDADOS CARREGADOS COM SUCESSO!")
+print(f"   Pacientes processados: {len(patients_loaded)}")
+print(f"   Total de janelas: {len(df):,}")
+print(f"   Arquivos com crise: {df[df['label']==1]['file'].nunique()}")
+
+# 5. ANÁLISE POR PACIENTE - MATRIZES DE CONFUSÃO
+
+print("\n" + "=" * 80)
+print("ANÁLISE POR PACIENTE - MATRIZES DE CONFUSÃO INDIVIDUAIS")
+print("=" * 80)
+
+SIGMA_OPTIMAL = 1.5  
+
+# Dicionário para armazenar resultados por paciente
+patient_results = {
+    'Kalman': {},
+    'RLS': {}
+}
+
+# DataFrame para armazenar matrizes de confusão
+confusion_matrices_list = []
+
+for patient_id in tqdm(patients_loaded, desc="Analisando pacientes"):
+    df_patient = df[df['patient'] == patient_id].copy()
+    
+    # Verifica se há crises
+    if df_patient['label'].sum() == 0:
+        continue
+    
+    # Testa Kalman e RLS
+    for algo_class in [KalmanFilter, RLSFilter]:
+        algo = algo_class() if algo_class == KalmanFilter else RLSFilter(order=RLS_ORDER, lam=RLS_LAMBDA)
+        
+        # Aplica algoritmo em todos os arquivos do paciente
+        patient_data_processed = []
+        
+        for file_name in df_patient['file'].unique():
+            df_file = df_patient[df_patient['file'] == file_name].copy()
+            
+            algo.reset()
+            errors = []
+            for feat_val in df_file['feature_combined'].values:
+                _, error = algo.update(feat_val)
+                errors.append(error)
+            
+            df_file[f'error'] = errors
+            df_file[f'error_smooth'] = pd.Series(errors).rolling(
+                window=SMOOTHING_WINDOW, min_periods=1
+            ).mean().values
+            
+            patient_data_processed.append(df_file)
+        
+        df_patient_processed = pd.concat(patient_data_processed, ignore_index=True)
+        
+        # Calcula limiar baseado em região interictal pura
+        baseline = df_patient_processed[(df_patient_processed['label'] == 0) & 
+                                       (df_patient_processed['pre_ictal'] == 0)]
+        
+        if len(baseline) < 10:
+            continue
+        
+        mean_error = baseline['error_smooth'].mean()
+        std_error = baseline['error_smooth'].std()
+        threshold = mean_error + SIGMA_OPTIMAL * std_error
+        
+        # Aplica detecção
+        df_patient_processed['alert_raw'] = (df_patient_processed['error_smooth'] > threshold).astype(int)
+        
+        # Alerta sustentado
+        df_patient_processed['alert'] = df_patient_processed.groupby('file')['alert_raw'].rolling(
+            window=10, min_periods=10
+        ).sum().reset_index(level=0, drop=True)
+        df_patient_processed['alert'] = (df_patient_processed['alert'] == 10).astype(int)
+        
+        # MATRIZ DE CONFUSÃO DO PACIENTE janelas não-ictais
+        df_eval = df_patient_processed[df_patient_processed['label'] == 0]
+        
+        if len(df_eval) > 0:
+            y_true = df_eval['pre_ictal'].values
+            y_pred = df_eval['alert'].values
+            
+            cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+            TN, FP, FN, TP = cm[0, 0], cm[0, 1], cm[1, 0], cm[1, 1]
+            
+            # Métricas
+            accuracy = (TP + TN) / (TP + TN + FP + FN + 1e-10)
+            precision = TP / (TP + FP + 1e-10)
+            recall = TP / (TP + FN + 1e-10)
+            specificity = TN / (TN + FP + 1e-10)
+            f1 = 2 * precision * recall / (precision + recall + 1e-10)
+            
+            # SPR (por evento)
+            num_seizures = df_patient_processed[df_patient_processed['label'] == 1]['file'].nunique()
+            seizures_detected = 0
+            
+            for file_name in df_patient_processed[df_patient_processed['label'] == 1]['file'].unique():
+                df_file = df_patient_processed[df_patient_processed['file'] == file_name]
+                pre_ictal_alerts = df_file[(df_file['pre_ictal'] == 1) & (df_file['alert'] == 1)]
+                if not pre_ictal_alerts.empty:
+                    seizures_detected += 1
+            
+            spr = seizures_detected / num_seizures if num_seizures > 0 else 0
+            
+            # Armazena resultados
+            confusion_matrices_list.append({
+                'Paciente': patient_id,
+                'Algoritmo': algo.name,
+                'TN': TN,
+                'FP': FP,
+                'FN': FN,
+                'TP': TP,
+                'Acurácia': accuracy,
+                'Precision': precision,
+                'Recall': recall,
+                'Specificity': specificity,
+                'F1-Score': f1,
+                'SPR': spr,
+                'Num_Crises': num_seizures,
+                'Crises_Detectadas': seizures_detected
+            })
+
+# Converte para DataFrame
+df_confusion = pd.DataFrame(confusion_matrices_list)
+
+# Salva resultados detalhados por paciente
+df_confusion.to_csv('matrizes_confusao_por_paciente.csv', index=False)
+print("\n Resultados salvos: matrizes_confusao_por_paciente.csv")
+
+
+# 6. MATRIZES MÉDIAS AGREGADAS
+
+print("\n" + "=" * 80)
+print("MATRIZES DE CONFUSÃO MÉDIAS AGREGADAS")
+print("=" * 80)
+
+for algo_name in ['Kalman', 'RLS']:
+    df_algo = df_confusion[df_confusion['Algoritmo'] == algo_name]
+    
+    if len(df_algo) == 0:
+        continue
+    
+    print(f"\n{'='*70}")
+    print(f"ALGORITMO: {algo_name}")
+    print(f"{'='*70}")
+    
+    # Soma total das matrizes
+    tn_total = df_algo['TN'].sum()
+    fp_total = df_algo['FP'].sum()
+    fn_total = df_algo['FN'].sum()
+    tp_total = df_algo['TP'].sum()
+    
+    # Métricas agregadas
+    accuracy_agg = (tp_total + tn_total) / (tp_total + tn_total + fp_total + fn_total)
+    precision_agg = tp_total / (tp_total + fp_total + 1e-10)
+    recall_agg = tp_total / (tp_total + fn_total + 1e-10)
+    specificity_agg = tn_total / (tn_total + fp_total + 1e-10)
+    f1_agg = 2 * precision_agg * recall_agg / (precision_agg + recall_agg + 1e-10)
+    spr_mean = df_algo['SPR'].mean()
+    
+    print(f"\nMATRIZ DE CONFUSÃO AGREGADA:")
+    print(f"   {'─'*60}")
+    print(f"                     Predito")
+    print(f"              Normal (0)    Pré-ictal (1)")
+    print(f"   Real  Normal (0)   {tn_total:>10,}    {fp_total:>10,}")
+    print(f"         Pré-ictal(1) {fn_total:>10,}    {tp_total:>10,}")
+    print(f"   {'─'*60}")
+    
+    print(f"\nMÉTRICAS AGREGADAS (Total de {len(df_algo)} pacientes):")
+    print(f"   {'─'*60}")
+    print(f"   Acurácia:       {accuracy_agg:.4f} ({accuracy_agg*100:.2f}%)")
+    print(f"   Precision:      {precision_agg:.4f} ({precision_agg*100:.2f}%)")
+    print(f"   Recall:         {recall_agg:.4f} ({recall_agg*100:.2f}%)")
+    print(f"   Specificity:    {specificity_agg:.4f} ({specificity_agg*100:.2f}%)")
+    print(f"   F1-Score:       {f1_agg:.4f}")
+    print(f"   SPR Média:      {spr_mean:.4f} ({spr_mean*100:.2f}%)")
+    print(f"   {'─'*60}")
+    
+    print(f"\nESTATÍSTICAS POR PACIENTE:")
+    print(f"   Média Acurácia:     {df_algo['Acurácia'].mean():.4f} ± {df_algo['Acurácia'].std():.4f}")
+    print(f"   Média Precision:    {df_algo['Precision'].mean():.4f} ± {df_algo['Precision'].std():.4f}")
+    print(f"   Média Recall:       {df_algo['Recall'].mean():.4f} ± {df_algo['Recall'].std():.4f}")
+    print(f"   Média Specificity:  {df_algo['Specificity'].mean():.4f} ± {df_algo['Specificity'].std():.4f}")
+    print(f"   Crises totais:      {df_algo['Num_Crises'].sum()}")
+    print(f"   Crises detectadas:  {df_algo['Crises_Detectadas'].sum()}")
+
+# 7. VISUALIZAÇÕES
+
+print("\n" + "=" * 80)
+print("📊 GERANDO VISUALIZAÇÕES")
+print("=" * 80)
+
+# ========================================
+# GRÁFICO 1: Matrizes de Confusão Agregadas
+# ========================================
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+for idx, algo_name in enumerate(['Kalman', 'RLS']):
+    df_algo = df_confusion[df_confusion['Algoritmo'] == algo_name]
+    
+    if len(df_algo) == 0:
+        continue
+    
+    tn_total = df_algo['TN'].sum()
+    fp_total = df_algo['FP'].sum()
+    fn_total = df_algo['FN'].sum()
+    tp_total = df_algo['TP'].sum()
+    
+    cm = np.array([[tn_total, fp_total], [fn_total, tp_total]])
+    
+    sns.heatmap(cm, annot=True, fmt=',', cmap='Blues', 
+                xticklabels=['Normal', 'Pré-ictal'],
+                yticklabels=['Normal', 'Pré-ictal'],
+                ax=axes[idx], cbar_kws={'label': 'Contagem'},
+                annot_kws={'size': 14, 'weight': 'bold'})
+    
+    axes[idx].set_title(f'{algo_name}\n(σ = {SIGMA_OPTIMAL})', 
+                       fontsize=14, fontweight='bold')
+    axes[idx].set_xlabel('Predito', fontsize=12, fontweight='bold')
+    axes[idx].set_ylabel('Real', fontsize=12, fontweight='bold')
+
+fig.suptitle('Matrizes de Confusão Agregadas - Todos os Pacientes', 
+             fontsize=16, fontweight='bold', y=1.02)
+plt.tight_layout()
+plt.savefig('matriz_confusao_agregada.png', dpi=300, bbox_inches='tight')
+plt.close()
+print(" matriz_confusao_agregada.png")
+
+# ========================================
+# GRÁFICO 2: Comparação de Métricas por Paciente
+# ========================================
+fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+
+metrics_to_plot = [
+    ('Acurácia', 'Acurácia por Paciente'),
+    ('SPR', 'SPR (Taxa de Detecção) por Paciente'),
+    ('F1-Score', 'F1-Score por Paciente'),
+    ('Specificity', 'Especificidade por Paciente')
+]
+
+for idx, (metric, title) in enumerate(metrics_to_plot):
+    ax = axes[idx // 2, idx % 2]
+    
+    for algo_name in ['Kalman', 'RLS']:
+        df_algo = df_confusion[df_confusion['Algoritmo'] == algo_name]
+        
+        if len(df_algo) > 0:
+            patients = df_algo['Paciente'].values
+            values = df_algo[metric].values
+            
+            ax.plot(range(len(patients)), values, marker='o', 
+                   label=algo_name, linewidth=2, markersize=8)
+    
+    ax.set_xlabel('Índice do Paciente', fontsize=11, fontweight='bold')
+    ax.set_ylabel(metric, fontsize=11, fontweight='bold')
+    ax.set_title(title, fontsize=12, fontweight='bold')
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3, linestyle='--')
+
+fig.suptitle('Comparação de Métricas por Paciente', fontsize=16, fontweight='bold')
+plt.tight_layout()
+plt.savefig('metricas_por_paciente.png', dpi=300, bbox_inches='tight')
+plt.close()
+print("metricas_por_paciente.png")
+
+# GRÁFICO 3: Distribuição de Métricas (Boxplots)
+
+fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+axes = axes.flatten()
+
+metrics = ['Acurácia', 'Precision', 'Recall', 'Specificity', 'F1-Score', 'SPR']
+
+for idx, metric in enumerate(metrics):
+    data_to_plot = []
+    labels = []
+    
+    for algo_name in ['Kalman', 'RLS']:
+        df_algo = df_confusion[df_confusion['Algoritmo'] == algo_name]
+        if len(df_algo) > 0:
+            data_to_plot.append(df_algo[metric].values)
+            labels.append(algo_name)
+    
+    if data_to_plot:
+        bp = axes[idx].boxplot(data_to_plot, labels=labels, patch_artist=True,
+                               boxprops=dict(facecolor='lightblue', alpha=0.7),
+                               medianprops=dict(color='red', linewidth=2))
+        
+        axes[idx].set_ylabel(metric, fontsize=11, fontweight='bold')
+        axes[idx].set_title(f'Distribuição: {metric}', fontsize=12, fontweight='bold')
+        axes[idx].grid(True, alpha=0.3, linestyle='--', axis='y')
+
+fig.suptitle('Distribuição de Métricas - Todos os Pacientes', fontsize=16, fontweight='bold')
+plt.tight_layout()
+plt.savefig('distribuicao_metricas.png', dpi=300, bbox_inches='tight')
+plt.close()
+print("distribuicao_metricas.png")
+
+# 8. TABELAS RESUMO
+
+print("\n" + "=" * 80)
+print("GERANDO TABELAS RESUMO")
+print("=" * 80)
+
+# Tabela resumo por algoritmo
+summary_stats = []
+
+for algo_name in ['Kalman', 'RLS']:
+    df_algo = df_confusion[df_confusion['Algoritmo'] == algo_name]
+    
+    if len(df_algo) == 0:
+        continue
+    
+    summary_stats.append({
+        'Algoritmo': algo_name,
+        'Pacientes Analisados': len(df_algo),
+        'Acurácia Média': f"{df_algo['Acurácia'].mean():.4f} ± {df_algo['Acurácia'].std():.4f}",
+        'Precision Média': f"{df_algo['Precision'].mean():.4f} ± {df_algo['Precision'].std():.4f}",
+        'Recall Médio': f"{df_algo['Recall'].mean():.4f} ± {df_algo['Recall'].std():.4f}",
+        'Specificity Média': f"{df_algo['Specificity'].mean():.4f} ± {df_algo['Specificity'].std():.4f}",
+        'F1-Score Médio': f"{df_algo['F1-Score'].mean():.4f} ± {df_algo['F1-Score'].std():.4f}",
+        'SPR Médio': f"{df_algo['SPR'].mean():.4f} ({df_algo['SPR'].mean()*100:.2f}%)",
+        'Total Crises': df_algo['Num_Crises'].sum(),
+        'Crises Detectadas': df_algo['Crises_Detectadas'].sum()
+    })
+
+df_summary = pd.DataFrame(summary_stats)
+df_summary.to_csv('resumo_estatistico_algoritmos.csv', index=False)
+print("\nTabela resumo salva: resumo_estatistico_algoritmos.csv")
+print("\n" + df_summary.to_string(index=False))
+
+print("\n" + "=" * 80)
+print("ANÁLISE COMPLETA FINALIZADA!")
+print("=" * 80)
+print("\nARQUIVOS GERADOS:")
+print("   1. matrizes_confusao_por_paciente.csv")
+print("   2. resumo_estatistico_algoritmos.csv")
+print("   3. matriz_confusao_agregada.png")
+print("   4. metricas_por_paciente.png")
+print("   5. distribuicao_metricas.png")
+print("\nTodas as matrizes de confusão individuais e agregadas foram geradas!")
+print("=" * 80)
